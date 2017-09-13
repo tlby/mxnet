@@ -1,0 +1,630 @@
+#!/usr/bin/env python
+import ast
+import re
+import subprocess
+import sys
+import json
+
+# https://docs.python.org/2/library/ast.html
+
+class PerlGen:
+    stack = []
+    def __init__(self, **kwarg):
+        self.module_name = kwarg['module_name']
+        self.indent_with = kwarg.get('indent_with', '    ')
+        self.source = kwarg['source']
+
+    def emit(self):
+        return self.as_perl(ast.parse(self.source))
+
+    def as_perl_unhandled(self, node):
+        if node != None:
+            s = ast.dump(node)
+        else:
+            s = '(nil)'
+        return [ '# ' + s, '...' ]
+
+
+    def as_perl(self, node):
+        method = 'as_perl_' + node.__class__.__name__
+        handler = getattr(self, method, self.as_perl_unhandled)
+        prev = self.stack
+        self.stack = [ node ] + prev
+        #try:
+        rv = handler(node)
+        #except Exception as err:
+        #    print err
+        #    rv = self.as_perl_unhandled(node)
+        self.stack = prev
+        return rv
+
+    def as_perl_Module(self, mod):
+        pname = self.pl_name(self.module_name)
+        pbody = [
+            "package " + pname + ";",
+            "use strict;",
+            "use warnings;",
+            "use Scalar::Util 'blessed';",
+            "use AI::MXNet::Base;",
+            "use AI::MXNet::Function::Parameters;", "",
+        ]
+        body = mod.body
+        ds = ast.get_docstring(mod)
+        if ds != None:
+            body = body[1:]
+            pbody = pbody + self.pod("=head1 NAME", pname + " - " + ds)
+        pbody = pbody + self.pl_block(body)
+        return pbody + [ "1;" ]
+
+    def as_perl_FunctionDef_Nested(self, func, prnt):
+        pargs = self.as_perl(func.args)
+        pname = func.name
+        pbody = [ "my $" + pname + " = sub {" ] + self.indent(
+            pargs.body + [
+                "my(" + ", ".join(pargs.args) + ") = @_;"
+            ] + self.pl_block(func.body, pargs.ns)
+        ) + [ "}" ]
+        self.ns_add(pname, '$')
+        return pbody
+
+    def as_perl_Num(self, num):
+        return [ str(num.n) ]
+
+    def as_perl_arguments(self, args):
+        # unlike most as_perl_X functions, this returns an object, not a
+        # list of code lines
+        class Args:
+            ns = {}
+            args = []
+            body = []
+        pargs = Args()
+        for arg in args.args:
+            pargs.ns[arg.id] = '$'
+            pargs.args += [ '$' + arg.id ]
+        off = len(args.args) - len(args.defaults)
+        for i in range(0, len(args.defaults)):
+            val = self.as_perl(args.defaults[i])
+            if len(val) == 1:
+                pargs.args[off + i] += '=' + val[0]
+            else:
+                pargs.body += [ "# " + args.args[off + i] + "=" + ast.dump(args.defaults[i]) ]
+        if args.vararg:
+            pargs.ns[args.vararg] = '@'
+            pargs.args += [ '@' + args.vararg ]
+        if args.kwarg:
+            pargs.ns[args.kwarg] = '%'
+            pargs.args += [ '%' + args.kwarg ]
+        return pargs
+
+    def as_perl_FunctionDef(self, func):
+        for prnt in self.stack[1:]:
+            if isinstance(prnt, ast.FunctionDef):
+                return self.as_perl_FunctionDef_Nested(func, prnt)
+        pargs = self.as_perl(func.args)
+        if func.name == '__init__':
+            pname = 'method new'
+        elif func.name == '__str__':
+            pname = 'use overload \'""\' => method'
+        elif func.name == '__eq__':
+            pname = 'use overload \'==\' => method'
+        else:
+            pname = 'method ' + func.name
+        body = func.body
+        ds = ast.get_docstring(func)
+        if ds:
+            body = body[1:]
+            pod = self.pod("=head2 " + pname, ds)
+        else:
+            pod = []
+        pbody = self.indent(self.pl_block(body, pargs.ns))
+        if len(pargs.args) > 0 and pargs.args[0] == '$self':
+            pargs.args = pargs.args[1:]
+        pbody = pod + pargs.body + [
+            pname + "(" + ", ".join(pargs.args) + ")",
+            "{" ] + pbody + [ "}" ]
+        return pbody
+
+    def as_perl_ClassDef(self, cls):
+        pname = self.pl_name(cls.name)
+        pbody = [
+            "use Mouse;",
+            "use AI::MXNet::Base;",
+        ]
+        # deal with base classes
+        for base in cls.bases:
+            pbody += self.pl_line([ 'extends ' ], self.as_perl(base), [';'])
+        # work through the body
+        body = cls.body
+        ds = ast.get_docstring(cls)
+        if ds:
+            body = body[1:]
+            pbody = pbody + self.pod("=head2 " + pname, ds)
+        pbody = pbody + self.pl_block(body)
+        return [ "package " + pname + " {" ] + self.indent(pbody) + [ "}" ];
+
+    def as_perl_Return(self, ret):
+        if ret.value:
+            return self.pl_line([ "return " ], self.as_perl(ret.value))
+        return [ "return" ]
+
+    def as_perl_Name(self, name):
+        if name.id == "None":
+            return [ "undef" ]
+        if name.id == "False":
+            return [ "''" ]
+        if name.id == "True":
+            return [ "'1'" ]
+        if name.id == "_":
+            return [ "undef" ]
+        sigil = self.ns_get(name.id)
+        if not sigil:
+            sigil = ''
+        return [ sigil + name.id ]
+
+    def as_perl_Call(self, call):
+        pcall = self.as_perl(call.func)
+        pargs = self.pl_list(call.args)
+        for kw in call.keywords:
+            val = self.as_perl(kw.value)
+            if len(pargs) > 0:
+                pargs[-1] += ", '" + kw.arg + "' => " + val[0]
+            else:
+                pargs = [ "'" + kw.arg + "' => " + val[0] ]
+            pargs += val[1:]
+        if call.kwargs:
+            val = self.as_perl(call.kwargs)
+            if len(pargs) > 0:
+                pargs[-1] += ', ' + val[0]
+            else:
+                pargs = [ val[0] ]
+            pargs += val[1:]
+        if len(pargs) == 0:
+            pargs = [ '()' ]
+        else:
+            pargs[0] = '(' + pargs[0]
+            pargs[-1] = pargs[-1] + ')'
+        pcall[-1] += pargs[0]
+        return pcall + pargs[1:]
+
+    def as_perl_List(self, lst):
+        plst = self.pl_list(lst.elts)
+        if len(plst) == 0:
+            return [ '[]' ]
+        plst[0] = '[ ' + plst[0]
+        plst[-1] += ' ]'
+        return plst
+
+    def as_perl_Expr(self, expr):
+        val = self.as_perl(expr.value)
+        if len(val) > 1:
+            val = [ "do {" ] + self.indent(val) + [ "}" ]
+        return val
+
+    def as_perl_Str(self, txt):
+        # TODO: obviously, this will need more work
+        return [ json.dumps(txt.s) ]
+
+    def as_perl_Attribute(self, attr):
+        val = self.as_perl(attr.value)
+        val[-1] = val[-1] + '->' + attr.attr
+        return val
+
+    def as_perl_If(self, branch):
+        pbody = self.pl_line(
+            [ "if(" ], self.as_perl(branch.test), [ ") {" ]
+        )
+        pbody += self.indent(self.pl_block(branch.body, False))
+        pbody += [ "}" ]
+        # unfolding back into elifs is a bit awkward
+        if branch.orelse:
+            if len(branch.orelse) == 1 and isinstance(branch.orelse[0], ast.If):
+                ptail = self.as_perl(branch.orelse[0])
+                pbody[-1] += " els" + ptail[0]
+                pbody += ptail[1:]
+            else:
+                pbody[-1] += " else {"
+                pbody += self.indent(self.pl_block(branch.orelse, False)) + [ "}" ]
+        return pbody
+
+    def as_perl_For(self, loop):
+        if not isinstance(loop.target, ast.Name):
+            # TODO: not ready to handle destructuring yet
+            return self.as_perl_unhandled(loop)
+        ns = { loop.target.id: '$' }
+        pbody = self.as_perl(loop.iter)
+        pbody[0] = "for my $" + loop.target.id + " (@{" + pbody[0]
+        pbody[-1] += "}) {"
+        pbody += self.indent(self.pl_block(loop.body)) + [ "}" ]
+        return pbody
+
+    def as_perl_Raise(self, rs):
+        if rs.inst or rs.tback:
+            return self.as_perl_unhandled(rs)
+        val = self.as_perl(rs.type)
+        val[0] = 'die ' + val[0]
+        return val
+
+    def as_perl_Assign(self, assign):
+        if len(assign.targets) != 1:
+            return self.as_perl_unhandled(assign)
+        targ = assign.targets[0]
+        if isinstance(targ, ast.Name):
+            self.ns_add(targ.id, '$')
+        elif isinstance(targ, ast.Tuple):
+            for elt in targ.elts:
+                self.ns_add(elt.id, '$')
+
+        return self.pl_line(
+            [ 'my ' ], self.as_perl(targ),
+            [ ' = ' ], self.as_perl(assign.value),
+        )
+
+    def as_perl_Tuple(self, tpl):
+        return self.pl_line(
+            [ '(' ], self.pl_list(tpl.elts), [ ')' ]
+        )
+
+    def as_perl_BoolOp(self, op):
+        if isinstance(op.op, ast.Or):
+            join = ' or '
+        elif isinstance(op.op, ast.And):
+            join = ' and '
+        else:
+            return self.as_perl_unhandled(op)
+        pbody = []
+        for val in op.values:
+            pval = self.as_perl(val)
+            if len(pbody) == 0:
+                pbody = pval
+            else:
+                pbody[-1] += join + pval[0]
+                pbody += pval[1:]
+        return pbody
+
+    def as_perl_UnaryOp(self, op):
+        if isinstance(op.op, ast.Not):
+            txt = "not"
+        elif isinstance(op.op, ast.USub):
+            txt = "-"
+        else:
+            return self.as_perl_unhandled(op)
+        return self.pl_line([ txt + "(" ], self.as_perl(op.operand), [ ")" ])
+
+    def as_perl_BinOp(self, op):
+        if isinstance(op.op, ast.Add):
+            txt = "+"
+        elif isinstance(op.op, ast.Sub):
+            txt = "-"
+        elif isinstance(op.op, ast.Mult):
+            txt = "*"
+        elif isinstance(op.op, ast.Div):
+            txt = "/"
+        elif isinstance(op.op, ast.Mod):
+            if isinstance(op.left, ast.Str) and isinstance(op.right, ast.Tuple):
+                # this is actually just a sprintf() call
+                return self.as_perl(ast.Call(
+                    func = ast.Name(id = 'sprintf'),
+                    args = [ op.left ] + op.right.elts,
+                    keywords = [],
+                    kwargs = [],
+                ))
+            else:
+                txt = "%"
+        else:
+            return self.as_perl_unhandled(op)
+        return self.pl_line(
+            [ "(" ],
+            self.as_perl(op.left),
+            [ ") " + txt + " (" ],
+            self.as_perl(op.right), [ ")" ],
+        )
+
+    def as_perl_Subscript(self, sub):
+        return self.pl_line(
+            self.as_perl(sub.value),
+            [ "->[" ], self.as_perl(sub.slice), [ "]" ])
+
+    def as_perl_Index(self, ind):
+        return self.as_perl(ind.value)
+
+    def as_perl_Compare(self, comp):
+        if len(comp.ops) != 1:
+            return self.as_perl_unhandled(comp)
+        if isinstance(comp.ops[0], ast.Lt):
+            txt = '<'
+        elif isinstance(comp.ops[0], ast.Gt):
+            txt = '>'
+        elif isinstance(comp.ops[0], ast.Eq):
+            txt = '=='
+        #elif isinstance(comp.ops[0], ast.IsNot):
+        #    txt = 'ne' TODO!!
+        #elif isinstance(comp.ops[0], ast.Is):
+        #    txt = 'ne' TODO!!
+        else:
+            return self.as_perl_unhandled(comp)
+        return self.pl_line(
+            [ '(' ],
+            self.as_perl(comp.left),
+            [ ") " + txt + " (" ],
+            self.as_perl(comp.comparators[0]),
+            [ ")" ],
+        )
+
+    def as_perl_TryExcept(self, tc):
+        # sortof cheating here by rewriting ast and then converting that
+        pbody = [
+            "eval {",
+        ] + self.indent(self.pl_block(tc.body, False)) + [
+            "};",
+        ]
+        if len(tc.orelse):
+            hunk = tc.orelse
+        else:
+            hunk = [ ast.Call(
+                func = ast.Name(id = 'die'),
+                args = [],
+                keywords = [],
+                kwargs = [],
+            ) ]
+        for handler in reversed(tc.handlers):
+            hunk = [ ast.If(
+                test = ast.Call(
+                    func = ast.Name(id = 'isinstance'),
+                    args = [
+                        ast.Name(id = '$@'),
+                        handler.type,
+                    ],
+                    keywords = [],
+                    kwargs = [],
+                ),
+                body = handler.body,
+                orelse = hunk,
+            ) ]
+        
+        pbody += self.pl_block(hunk, False)
+        return pbody
+
+    def as_perl_Print(self, prt):
+        if prt.dest:
+            return self.as_perl_unhandled(prt)
+        vals = prt.values[:]
+        if prt.nl:
+            vals += [ ast.Str(s = "\n") ]
+        return self.as_perl(ast.Call(
+            func = ast.Name(id = 'print'),
+            args = vals,
+            keywords = [],
+            kwargs = [],
+        ))
+
+    def as_perl_Assert(self, asrt):
+        args = [ asrt.test ]
+        if asrt.msg is not None:
+            args += [ asrt.msg ]
+        return self.as_perl(ast.Call(
+            func = ast.Name(id = 'assert'),
+            args = args,
+            keywords = [],
+            kwargs = [],
+        ))
+
+    def as_perl_Dict(self, dct):
+        defs = []
+        for (k, v) in zip(dct.keys, dct.values):
+            defs += self.as_perl(k)
+            val = self.as_perl(v)
+            defs[-1] += ' => ' + val[0]
+            defs += val[1:]
+            defs[-1] += ','
+        return [ '{' ] + self.indent(defs) + [ '}' ]
+
+    #def as_perl_ListComp(self, lc):
+    #    # since list comprehension namespacing is so weird, I'm just
+    #    # going to unfold these into traditional for/if statements.
+    #    # we should really want these to be map/grep but they are not
+    #    # similar enough language constructs
+    #    #
+    #    # Mechanically, this is very different from the others.  It's
+    #    # going to rewrite the ListComp to other ast nodes, and convert
+    #    # those instead.
+    #    node = lc.elt
+    #    for comp in lc.generators:
+    #        l = []
+    #        for cond in comp.ifs:
+    #            l += [ ast.If(
+    #                test = cond,
+    #                body = [ 
+    #                    ast.Call(func=ast.Name(id='next', ctx=ast.Load()), args=[], keywords=[], starargs=None, kwargs=None)
+    #                ],
+    #                orelse = None,
+    #            ) ]
+    #        node = ast.For(
+    #            target = comp.target,
+    #            iter = comp.iter,
+    #            body = l + [ node ],
+    #        )
+    #    return self.as_perl(node)
+#ListComp(
+#    elt=Name(id='x', ctx=Load()),
+#    generators=[
+#        comprehension(
+#            target=Name(id='x', ctx=Store()),
+#            iter=Call(func=Name(id='range', ctx=Load()), args=[Num(n=2), Num(n=50)], keywords=[], starargs=None, kwargs=None),
+#            ifs=[
+#                Compare(
+#                    left=Name(id='x', ctx=Load()),
+#                    ops=[NotIn()],
+#                    comparators=[
+#                        Name(id='noprimes', ctx=Load())
+#                    ]
+#                )
+#            ]
+#        )
+#    ]
+#)
+#        ListComp(
+#            elt=Name(id='ret', ctx=Load()),
+#            generators=[
+#                comprehension(target=Name(id='src', ctx=Store()), iter=Name(id='data', ctx=Load()), ifs=[]),
+#                comprehension(target=Name(id='ret', ctx=Store()), iter=Call(func=Name(id='aug', ctx=Load()), args=[Name(id='src', ctx=Load())], keywords=[], starargs=None, kwargs=None), ifs=[])
+#            ]
+#        )
+
+    def pl_block(self, stmts, ns=None):
+        if ns == None:
+            ns = {}
+        # emit a codeblock
+        pbody = []
+        if ns != False:
+            self.scope_enter(ns)
+        for stmt in stmts:
+            pstmt = self.as_perl(stmt)
+            if pstmt[-1] != "}":
+                pstmt[-1] += ';'
+            pbody += pstmt
+        if ns != False:
+            self.scope_leave()
+        return pbody
+
+    def pl_line(self, *lol):
+        out = []
+        if len(lol):
+            out += lol[0]
+            lol = lol[1:]
+        for l in lol:
+            if len(l):
+                out[-1] += l[0]
+                out += l[1:]
+        return out
+
+    def pl_list(self, exprs):
+        # emit a list, probably of arguments
+        plist = []
+        for expr in exprs:
+            pexpr = self.as_perl(expr)
+            if len(plist) > 0:
+                plist[-1] += ", "
+                plist = plist[:-1] + [ plist[-1] + pexpr[0] ] + pexpr[1:]
+            else:
+                plist = pexpr
+        return plist
+
+    pl_names = {
+    }
+    def pl_name(self, name):
+        # translate a python name to a perl name
+        # this is going to need a override table for sure
+        if name in self.pl_names:
+            return self.pl_names[name]
+        if name:
+            return "AI::MXNet::" + name[0].upper() + name[1:]
+        return 'AI::MXNet'
+
+    scope = []
+    def scope_enter(self, ns):
+        self.scope = [ns] + self.scope
+
+    def scope_leave(self):
+        self.scope = self.scope[1:]
+
+    def ns_get(self, name):
+        for ns in self.scope:
+            if name in ns:
+                return ns[name]
+    
+    def ns_add(self, name, val):
+        self.scope[0][name] = val
+        return val + name
+
+    def pod(self, start, txt):
+        def fmt(line):
+            return "" if re.match('^\s*$', line) else '    ' + line
+        return [ start, "" ] + map(
+            fmt,
+            txt.split("\n"),
+        ) + [ "=cut", "" ]
+
+    def indent(self, lines):
+        inpod = [ False ]
+        def indent_line(line):
+            if re.match('^\s*$', line):
+                return ''
+            elif line == "=cut": # avoid indenting POD
+                inpod[0] = False
+            elif inpod[0]:
+                pass
+            elif len(line) > 0 and line[0] == "=":
+                inpod[0] = True
+            else:
+                return self.indent_with + line
+            return line
+        return map(indent_line, lines)
+
+class Patchy:
+    base = None
+    def git(self, *cmd):
+        return subprocess.Popen([
+            'git',
+            '--work-tree=' + self.base,
+            '--git-dir=' + self.base + '/.git',
+        ] + list(cmd), stdout = subprocess.PIPE)
+
+    def prev_src(self, fn):
+        f = open(fn, "r")
+        # go to one byte before the end
+        f.seek(-2, 2)
+        # scan backwards for newline
+        while f.read(1) != "\n":
+            f.seek(-2, 1)
+        # read the last line
+        line = f.readline()
+        #m = re.search('^# src: (.*)@{([0-9a-f]+)} ', line)
+        m = re.search('^# src: (.*)@{([0-9a-f]+)}', line)
+        if m:
+            path = m.group(1)
+            rev = m.group(2)
+            output = self.git('show', rev + ':' + path)
+            return output.communicate()[0]
+
+if __name__ == '__main__':
+    p = Patchy()
+    if len(sys.argv) > 1:
+        mod = sys.argv[1]
+    else:
+        mod = 'image'
+    p.base = "/home/developer/proj/ml/mxnet"
+    src = "python/mxnet/" + mod + ".py"
+    dst = "perl-package/AI-MXNet/lib/AI/MXNet/" + mod[0].upper() + mod[1:] + ".pm"
+
+    output = p.git('log', '-n', '1', '--pretty=%h %cd', '--', '/'.join([p.base, src]))
+    (h, cd) = output.communicate()[0].rstrip().split(" ", 1)
+    #prev = p.prev_src(p.base + '/' + dst)
+    #if prev:
+    #    prev_lines = PerlGen(
+    #        module_name = 'image',
+    #    ).as_perl(ast.parse(prev))
+    #    print "\n".join(prev_lines)
+    lines = [
+        '# Licensed to the Apache Software Foundation (ASF) under one',
+        '# or more contributor license agreements.  See the NOTICE file',
+        '# distributed with this work for additional information',
+        '# regarding copyright ownership.  The ASF licenses this file',
+        '# to you under the Apache License, Version 2.0 (the',
+        '# "License"); you may not use this file except in compliance',
+        '# with the License.  You may obtain a copy of the License at',
+        '#',
+        '#   http://www.apache.org/licenses/LICENSE-2.0',
+        '#',
+        '# Unless required by applicable law or agreed to in writing,',
+        '# software distributed under the License is distributed on an',
+        '# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY',
+        '# KIND, either express or implied.  See the License for the',
+        '# specific language governing permissions and limitations',
+        '# under the License.',
+        '',
+    ] + PerlGen(
+        module_name = mod,
+        source = open(p.base + "/" + src, "r").read()
+    ).emit() + [ "# src: " + src + "@{" + h + "} " + cd ]
+    cur = "\n".join(lines)
+    print cur
