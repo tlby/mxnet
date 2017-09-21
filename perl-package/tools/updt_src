@@ -59,10 +59,20 @@ class PerlGen:
     def as_perl_FunctionDef_Nested(self, func, prnt):
         pargs = self.as_perl(func.args)
         pname = func.name
+        body = func.body
+        ds = ast.get_docstring(func)
+        if ds:
+            ds = re.sub("^", "# ", ds)
+            # TODO: properly indent multiline docstrings->comment conversions
+            ds = re.sub("\n", "[\\\\n]", ds)
+            ds = [ ds ]
+            body = body[1:]
+        else:
+            ds = []
         pbody = [ "my $" + pname + " = sub {" ] + self.indent(
             pargs.body + [
                 "my(" + ", ".join(pargs.args) + ") = @_;"
-            ] + self.pl_block(func.body, pargs.ns)
+            ] + ds + self.pl_block(body, pargs.ns)
         ) + [ "}" ]
         self.ns_add(pname, '$')
         return pbody
@@ -82,7 +92,7 @@ class PerlGen:
             pargs.ns[arg.id] = '$'
             pargs.args += [ '$' + arg.id ]
         off = len(args.args) - len(args.defaults)
-        for i in range(0, len(args.defaults)):
+        for i in range(len(args.defaults)):
             val = self.as_perl(args.defaults[i])
             if len(val) == 1:
                 pargs.args[off + i] += '=' + val[0]
@@ -154,8 +164,6 @@ class PerlGen:
             return [ "''" ]
         if name.id == "True":
             return [ "'1'" ]
-        if name.id == "_":
-            return [ "undef" ]
         sigil = self.ns_get(name.id)
         if not sigil:
             sigil = ''
@@ -300,11 +308,12 @@ class PerlGen:
         elif isinstance(op.op, ast.Div):
             txt = "/"
         elif isinstance(op.op, ast.Mod):
-            if isinstance(op.left, ast.Str) and isinstance(op.right, ast.Tuple):
+            if isinstance(op.left, ast.Str):
+                right = op.right.elts if isinstance(op.right, ast.Tuple) else [ op.right ]
                 # this is actually just a sprintf() call
                 return self.as_perl(ast.Call(
                     func = ast.Name(id = 'sprintf'),
-                    args = [ op.left ] + op.right.elts,
+                    args = [ op.left ] + right,
                     keywords = [],
                     kwargs = [],
                 ))
@@ -418,57 +427,48 @@ class PerlGen:
             defs[-1] += ','
         return [ '{' ] + self.indent(defs) + [ '}' ]
 
-    #def as_perl_ListComp(self, lc):
-    #    # since list comprehension namespacing is so weird, I'm just
-    #    # going to unfold these into traditional for/if statements.
-    #    # we should really want these to be map/grep but they are not
-    #    # similar enough language constructs
-    #    #
-    #    # Mechanically, this is very different from the others.  It's
-    #    # going to rewrite the ListComp to other ast nodes, and convert
-    #    # those instead.
-    #    node = lc.elt
-    #    for comp in lc.generators:
-    #        l = []
-    #        for cond in comp.ifs:
-    #            l += [ ast.If(
-    #                test = cond,
-    #                body = [ 
-    #                    ast.Call(func=ast.Name(id='next', ctx=ast.Load()), args=[], keywords=[], starargs=None, kwargs=None)
-    #                ],
-    #                orelse = None,
-    #            ) ]
-    #        node = ast.For(
-    #            target = comp.target,
-    #            iter = comp.iter,
-    #            body = l + [ node ],
-    #        )
-    #    return self.as_perl(node)
-#ListComp(
-#    elt=Name(id='x', ctx=Load()),
-#    generators=[
-#        comprehension(
-#            target=Name(id='x', ctx=Store()),
-#            iter=Call(func=Name(id='range', ctx=Load()), args=[Num(n=2), Num(n=50)], keywords=[], starargs=None, kwargs=None),
-#            ifs=[
-#                Compare(
-#                    left=Name(id='x', ctx=Load()),
-#                    ops=[NotIn()],
-#                    comparators=[
-#                        Name(id='noprimes', ctx=Load())
-#                    ]
-#                )
-#            ]
-#        )
-#    ]
+    def as_perl_comprehension(self, comp, body):
+        var = self.as_perl(ast.Assign(
+            targets = [ comp.target ],
+            value = ast.Name(id = '$_')
+        ))
+        var[-1] += ';'
+        pmap = [ 'map {' ] + self.indent(var + body) + [ '} ' ]
+        for cond in comp.ifs:
+            pgrep = [ 'grep {' ] + self.indent(
+                var + self.as_perl(cond)
+            ) + [ '} ' ]
+            pmap = self.pl_line(pmap, pgrep);
+        pmap = self.pl_line(pmap, [ '@{' ], self.as_perl(comp.iter), [ '}' ]);
+        return pmap
+
+    def as_perl_ListComp(self, lc):
+        body = self.pl_block([ lc.elt ])
+        for comp in reversed(lc.generators):
+            body = self.as_perl_comprehension(comp, body)
+        return self.pl_line([ '[ ' ], body, [ ' ]' ]);
+
+    def as_perl_TryFinally(self, tf):
+        return [
+            "eval {",
+        ] + self.indent(self.pl_block(tf.body)) + [
+            "};",
+            "{ local $@;",
+        ] + self.indent(self.pl_block(tf.finalbody)) + [
+            "}",
+            "die if $@;"
+        ];
+
+
+#With(
+#    context_expr=Name(id='ctx', ctx=Load()),
+#    optional_vars=None,
+#    body=[Expr(value=Call(func=Attribute(value=Name(id='op', ctx=Load()), attr='forward', ctx=Load()), args=[], keywords=[keyword(arg='is_train', value=Name(id='is_train', ctx=Load())), keyword(arg='req', value=Name(id='reqs', ctx=Load())), keyword(arg='in_data', value=Subscript(value=Name(id='tensors', ctx=Load()), slice=Index(value=Num(n=0)), ctx=Load())), keyword(arg='out_data', value=Subscript(value=Name(id='tensors', ctx=Load()), slice=Index(value=Num(n=1)), ctx=Load())), keyword(arg='aux', value=Subscript(value=Name(id='tensors', ctx=Load()), slice=Index(value=Num(n=4)), ctx=Load()))], starargs=None, kwargs=None))]
 #)
-#        ListComp(
-#            elt=Name(id='ret', ctx=Load()),
-#            generators=[
-#                comprehension(target=Name(id='src', ctx=Store()), iter=Name(id='data', ctx=Load()), ifs=[]),
-#                comprehension(target=Name(id='ret', ctx=Store()), iter=Call(func=Name(id='aug', ctx=Load()), args=[Name(id='src', ctx=Load())], keywords=[], starargs=None, kwargs=None), ifs=[])
-#            ]
-#        )
+#    def as_perl_With(self, wth):
+#        return self.as_perl(
+#            ast.For(
+
 
     def pl_block(self, stmts, ns=None):
         if ns == None:
@@ -593,11 +593,11 @@ if __name__ == '__main__':
     else:
         mod = 'image'
     p.base = "/home/developer/proj/ml/mxnet"
-    src = "python/mxnet/" + mod + ".py"
+    src = 'python/mxnet/{}.py'.format(mod)
     dst = "perl-package/AI-MXNet/lib/AI/MXNet/" + mod[0].upper() + mod[1:] + ".pm"
 
-    output = p.git('log', '-n', '1', '--pretty=%h %cd', '--', '/'.join([p.base, src]))
-    (h, cd) = output.communicate()[0].rstrip().split(" ", 1)
+#    output = p.git('log', '-n', '1', '--pretty=%h %cd', '--', '/'.join([p.base, src]))
+#    (h, cd) = output.communicate()[0].rstrip().split(" ", 1)
     #prev = p.prev_src(p.base + '/' + dst)
     #if prev:
     #    prev_lines = PerlGen(
@@ -625,6 +625,6 @@ if __name__ == '__main__':
     ] + PerlGen(
         module_name = mod,
         source = open(p.base + "/" + src, "r").read()
-    ).emit() + [ "# src: " + src + "@{" + h + "} " + cd ]
+    ).emit()# + [ "# src: " + src + "@{" + h + "} " + cd ]
     cur = "\n".join(lines)
     print cur
