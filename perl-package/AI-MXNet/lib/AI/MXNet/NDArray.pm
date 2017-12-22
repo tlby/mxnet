@@ -50,6 +50,7 @@ use overload
     '<=' => \&lesser_equal,
     '.=' => \&set,
     '@{}'=> \&split_array,
+    '%{}'=> \&slice_hash,
     '='  => sub { $_[0] };
 
 extends 'AI::MXNet::NDArray::Base';
@@ -81,6 +82,21 @@ method STORABLE_thaw($cloning, $buf, $writable)
 method split_array(@args)
 {
      $self->shape->[0] > 1 ? $self->split(num_outputs => $self->shape->[0], squeeze_axis => 1, axis => 0) : [$self];
+}
+
+package AI::MXNet::NDArray::AsHash {
+    method TIEHASH($class: $nd) {
+        return bless [ $nd ], $class;
+    }
+    method FETCH($key) {
+        return $self->[0]->slice(map { $_ eq ':' ? 'X' : $_ } split /\s*,\s*/, $key);
+    }
+}
+
+method slice_hash($other, $swap)
+{
+    tie my(%tmp), 'AI::MXNet::NDArray::AsHash', $self;
+    return \%tmp;
 }
 
 method at(Index @indices)
